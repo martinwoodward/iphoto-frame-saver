@@ -50,10 +50,13 @@ final class Repository {
     volatile String downloadStatus = "";
     volatile boolean downloading;
     volatile boolean cancelDownload;
-    private long lastAttempt;
+    private volatile long lastAttempt;
     private String attachedIdentity = "";
     private AttachedStorage attached;
     private final java.util.Map<File, Integer> pins = new java.util.HashMap<>();
+    // Saved-photo startup must not wait for the monitor held by network transfers.
+    private final Object metadataLock = new Object();
+    private final Object cacheLock = new Object();
 
     final class Lease implements AutoCloseable {
         final File file;
@@ -62,10 +65,12 @@ final class Repository {
         Lease(File file, boolean temporary) {
             this.file = file;
             this.temporary = temporary;
-            pins.put(file, pins.containsKey(file) ? pins.get(file) + 1 : 1);
+            synchronized (cacheLock) {
+                pins.put(file, pins.containsKey(file) ? pins.get(file) + 1 : 1);
+            }
         }
         @Override public void close() {
-            synchronized (Repository.this) {
+            synchronized (cacheLock) {
                 if (closed) return;
                 closed = true;
                 int remaining = pins.get(file) - 1;
@@ -99,7 +104,11 @@ final class Repository {
 
     private File metadata(String key) { return new File(context.getFilesDir(), "album-" + key + ".json"); }
 
-    synchronized Snapshot load() {
+    Snapshot load() {
+        synchronized (metadataLock) { return loadSaved(); }
+    }
+
+    private Snapshot loadSaved() {
         String key = key();
         if (key.equals(current.key)) return current;
         lastAttempt = 0;
@@ -132,16 +141,18 @@ final class Repository {
         status = "Checking album for photos...";
         try {
             List<Photo> photos = new AlbumClient().fetch(AlbumAddress.parse(settings.album()));
-            if (!before.key.equals(key())) return load();
             long refreshed = System.currentTimeMillis();
             JSONArray array = new JSONArray();
             for (Photo p : photos) array.put(p.json());
             JSONObject json = new JSONObject().put("refreshed", refreshed).put("photos", array);
-            write(new AtomicFile(metadata(before.key)), json.toString().getBytes(StandardCharsets.UTF_8));
-            current = new Snapshot(before.key, photos, refreshed);
-            status = photos.isEmpty() ? "No photos found. Add photos to the shared album, then check again."
-                    : "Album up to date. " + photos.size() + " photos ready.";
-            return current;
+            synchronized (metadataLock) {
+                if (!before.key.equals(key())) return loadSaved();
+                write(new AtomicFile(metadata(before.key)), json.toString().getBytes(StandardCharsets.UTF_8));
+                current = new Snapshot(before.key, photos, refreshed);
+                status = photos.isEmpty() ? "No photos found. Add photos to the shared album, then check again."
+                        : "Album up to date. " + photos.size() + " photos ready.";
+                return current;
+            }
         } catch (FrameException e) {
             status = e.getMessage();
             throw e;
@@ -177,6 +188,42 @@ final class Repository {
     }
 
     static String filename(Photo p) { return hash(p.id) + ".photo"; }
+
+    private File cachedFile(Snapshot snapshot, Photo photo) {
+        String name = filename(photo);
+        File offline = new File(new File(new File(context.getFilesDir(), "offline"), snapshot.key), name);
+        if (offline.isFile()) return offline;
+        File stream = new File(new File(new File(context.getFilesDir(), "stream"), snapshot.key), name);
+        return stream.isFile() ? stream : null;
+    }
+
+    Lease acquireCached(Snapshot snapshot, Photo photo) {
+        synchronized (cacheLock) {
+            File source = cachedFile(snapshot, photo);
+            return source == null ? null : new Lease(source, false);
+        }
+    }
+
+    List<String> cachedIds(Snapshot snapshot) {
+        List<String> result = new ArrayList<>();
+        for (Photo photo : snapshot.photos) if (cachedFile(snapshot, photo) != null) result.add(photo.id);
+        return result;
+    }
+
+    void prepareStartupCache(Snapshot snapshot) {
+        if (snapshot.key.isEmpty() || !snapshot.key.equals(key())) return;
+        int target = Math.min(PlaybackPolicy.PREFETCH + 1, snapshot.photos.size());
+        List<String> window = cachedIds(snapshot);
+        if (window.size() >= target) return;
+        List<String> choices = new ArrayList<>();
+        for (Photo photo : snapshot.photos) choices.add(photo.id);
+        Collections.shuffle(choices);
+        for (String id : choices) {
+            if (window.size() == target) break;
+            if (!window.contains(id)) window.add(id);
+        }
+        prefetch(snapshot, "", window);
+    }
 
     synchronized Lease acquire(Snapshot snapshot, Photo photo, boolean network) throws FrameException {
         File source = file(snapshot, photo, network);
@@ -279,6 +326,10 @@ final class Repository {
     void stopPrefetch() { prefetchGeneration.incrementAndGet(); }
 
     private synchronized void prune(String key, Set<String> wanted, boolean preserveFallback) {
+        synchronized (cacheLock) { pruneLocked(key, wanted, preserveFallback); }
+    }
+
+    private void pruneLocked(String key, Set<String> wanted, boolean preserveFallback) {
         File dir = new File(new File(context.getFilesDir(), "stream"), key);
         File[] files = dir.listFiles();
         if (files == null) return;
@@ -301,9 +352,7 @@ final class Repository {
         List<String> result = new ArrayList<>();
         for (Photo p : snapshot.photos) {
             String name = filename(p);
-            File offline = new File(new File(new File(context.getFilesDir(), "offline"), snapshot.key), name);
-            File stream = new File(new File(new File(context.getFilesDir(), "stream"), snapshot.key), name);
-            if (offline.isFile() || stream.isFile()) result.add(p.id);
+            if (cachedFile(snapshot, p) != null) result.add(p.id);
             else if ("attached".equals(settings.storage())) {
                 AttachedStorage storage = attached(snapshot.key);
                 try { if (storage != null && storage.contains(name)) result.add(p.id); }

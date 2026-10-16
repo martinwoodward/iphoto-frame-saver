@@ -39,6 +39,7 @@ final class SlideshowController {
     private volatile int generation;
     private volatile boolean active;
     private boolean busy;
+    private boolean starting;
     private int front;
     private int renders;
     private int decodedWidth;
@@ -87,6 +88,7 @@ final class SlideshowController {
         active = true;
         generation++;
         busy = false;
+        starting = true;
         clock.start();
         repo.health(surface, renders, decodedWidth, decodedHeight, true);
         next();
@@ -116,6 +118,7 @@ final class SlideshowController {
         handler.removeCallbacks(tick);
         busy = true;
         final int token = generation;
+        final boolean cachedFirst = starting;
         final int width = Math.max(1, root.getWidth() > 0 ? root.getWidth()
                 : root.getResources().getDisplayMetrics().widthPixels);
         final int height = Math.max(1, root.getHeight() > 0 ? root.getHeight()
@@ -126,8 +129,24 @@ final class SlideshowController {
             String selected = null;
             Repository.Snapshot snapshot = repo.load();
             try {
-                try { snapshot = repo.refresh(false); }
-                catch (FrameException e) { error = e.getMessage(); }
+                if (cachedFirst) {
+                    List<String> saved = repo.cachedIds(snapshot);
+                    ShuffleDeck available = new ShuffleDeck(saved, new Random(), lastDisplayed);
+                    for (int i = 0; i < saved.size() && bitmap == null; i++) {
+                        Photo photo = snapshot.find(available.next());
+                        if (photo == null) continue;
+                        try (Repository.Lease source = repo.acquireCached(snapshot, photo)) {
+                            if (source != null) {
+                                bitmap = decode(source.file, photo, width, height);
+                                selected = photo.id;
+                            }
+                        } catch (FrameException e) { error = e.getMessage(); }
+                    }
+                }
+                if (bitmap == null) {
+                    try { snapshot = repo.refresh(false); }
+                    catch (FrameException e) { error = e.getMessage(); }
+                }
                 if (!active || token != generation) return;
                 if (repo.settings.album().isEmpty()) {
                     throw new FrameException("Open Photo Frame Saver to add a public shared album.");
@@ -137,18 +156,20 @@ final class SlideshowController {
                 if (!ids.equals(deckIds) || !deckKey.equals(snapshot.key)) {
                     deckIds = ids;
                     deckKey = snapshot.key;
-                    deck = new ShuffleDeck(ids, new Random(), lastDisplayed);
+                    deck = new ShuffleDeck(ids, new Random(), selected == null ? lastDisplayed : selected);
                 }
                 if (ids.isEmpty()) throw new FrameException(repo.status);
-                String id = deck.next();
-                if (ids.size() > 1 && id.equals(lastDisplayed)) id = deck.next();
-                Photo photo = snapshot.find(id);
-                if (photo != null) {
-                    try (Repository.Lease source = repo.acquire(snapshot, photo, true)) {
-                        bitmap = decode(source == null ? null : source.file, photo, width, height);
-                        selected = id;
+                if (bitmap == null) {
+                    String id = deck.next();
+                    if (ids.size() > 1 && id.equals(lastDisplayed)) id = deck.next();
+                    Photo photo = snapshot.find(id);
+                    if (photo != null) {
+                        try (Repository.Lease source = repo.acquire(snapshot, photo, true)) {
+                            bitmap = decode(source == null ? null : source.file, photo, width, height);
+                            selected = id;
+                        }
+                        catch (FrameException e) { error = e.getMessage(); }
                     }
-                    catch (FrameException e) { error = e.getMessage(); }
                 }
                 if (bitmap == null) {
                     List<String> saved = repo.playableIds(snapshot);
@@ -183,6 +204,7 @@ final class SlideshowController {
                     }
                     busy = false;
                     if (result != null) {
+                        starting = false;
                         lastDisplayed = displayedId;
                         repo.settings.prefs.edit().putString("last_displayed", displayedId).apply();
                         show(result);

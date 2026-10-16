@@ -116,7 +116,7 @@ public final class DeviceTests extends Instrumentation {
         check(snapshot.photos.size() == 8, "Metadata survives restart");
         check(restored.refresh(false).photos.size() == 8, "Manual mode uses saved metadata without network");
         check(restored.playableIds(snapshot).size() == 8, "Cached photos available with network disabled");
-        Repository.Lease pinned = restored.acquire(snapshot, snapshot.photos.get(7), false);
+        Repository.Lease pinned = restored.acquireCached(snapshot, snapshot.photos.get(7));
         restored.prefetch(snapshot, ids.get(0), ids.subList(1, 6));
         long deadline = System.currentTimeMillis() + 5000;
         while (stream.listFiles().length > 7 && System.currentTimeMillis() < deadline) Thread.sleep(50);
@@ -127,6 +127,11 @@ public final class DeviceTests extends Instrumentation {
         check(stream.listFiles().length == 6, "Current plus exactly five prefetched photos");
         check(restored.file(snapshot, snapshot.photos.get(0), false) != null, "Current photo retained");
         check(restored.playableIds(snapshot).size() == 6, "Six saved photos retained offline");
+        Repository cold = new Repository(isolated);
+        check(cold.cachedIds(cold.load()).size() == 6, "Six startup photos survive repository/process recreation");
+        cold.prepareStartupCache(cold.current);
+        check(stream.listFiles().length == 6, "A full startup cache does not bulk-download the album");
+        cold.background.shutdownNow();
         restored.settings.prefs.edit().putString("storage", "internal").commit();
         File offline = new File(new File(directory, "offline"), key);
         check(offline.isDirectory() || offline.mkdirs(), "Offline directory");
@@ -184,6 +189,21 @@ public final class DeviceTests extends Instrumentation {
         check(downloader.playableIds(downloader.current).size() == 3, "SAF photos discovered without copying");
         check(stream.listFiles().length == beforeEnumeration, "SAF enumeration does not bulk-fill internal cache");
         check(downloader.file(downloader.current, snapshot.photos.get(0), false) != null, "Selected SAF photo copied on demand");
+        check(destination.delete(), "Remove synthetic precedence fixture before startup warming");
+        for (int i = 3; i < snapshot.photos.size(); i++) {
+            fullDrive.save(Repository.filename(snapshot.photos.get(i)), source);
+        }
+        try (FileOutputStream out = new FileOutputStream(metadata)) {
+            out.write(new JSONObject().put("refreshed", System.currentTimeMillis()).put("photos", photos)
+                    .toString().getBytes(StandardCharsets.UTF_8));
+        }
+        Repository warmed = new Repository(isolated);
+        warmed.prepareStartupCache(warmed.load());
+        long warmingDeadline = System.currentTimeMillis() + 5000;
+        while (warmed.cachedIds(warmed.current).size() < 6 && System.currentTimeMillis() < warmingDeadline) Thread.sleep(20);
+        check(warmed.cachedIds(warmed.current).size() == 6, "Larger saved album warms exactly six startup photos");
+        check(stream.listFiles().length == 6, "Startup warming does not copy the entire attached album");
+        warmed.background.shutdownNow();
         Photo corrupt = new Photo("synthetic-corrupt", "https://example.icloud-content.com/synthetic", "", 1, 64, 64);
         File corruptBytes = new File(directory, "corrupt.photo");
         try (FileOutputStream out = new FileOutputStream(corruptBytes)) { out.write(new byte[] {1, 2, 3}); }
@@ -247,12 +267,36 @@ public final class DeviceTests extends Instrumentation {
             clock[0].stop();
             playbackRepo.settings.prefs.edit().putBoolean("clock", true).commit();
         });
-        SlideshowController[] controller = new SlideshowController[1];
-        runOnMainSync(() -> {
-            controller[0] = new SlideshowController(real, "synthetic-lifecycle", playbackRepo);
-            controller[0].start();
+        playbackRepo.settings.prefs.edit().putString("refresh", "hourly").commit();
+        try (FileOutputStream out = new FileOutputStream(metadata)) {
+            out.write(new JSONObject().put("refreshed", 0)
+                    .put("photos", new JSONArray().put(snapshot.photos.get(0).json()))
+                    .toString().getBytes(StandardCharsets.UTF_8));
+        }
+        java.util.concurrent.CountDownLatch networkBlocked = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch releaseNetwork = new java.util.concurrent.CountDownLatch(1);
+        Thread network = new Thread(() -> {
+            synchronized (playbackRepo) {
+                networkBlocked.countDown();
+                try { releaseNetwork.await(10, java.util.concurrent.TimeUnit.SECONDS); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }
         });
-        check(waitForRender(directory, 1), "Activity/dream controller renders cached photo");
+        network.start();
+        SlideshowController[] controller = new SlideshowController[1];
+        try {
+            check(networkBlocked.await(2, java.util.concurrent.TimeUnit.SECONDS), "Simulated network holds repository monitor");
+            runOnMainSync(() -> {
+                controller[0] = new SlideshowController(real, "synthetic-lifecycle", playbackRepo);
+                controller[0].start();
+            });
+            check(waitForRender(directory, 1), "Cold startup renders cached photo before an overdue or blocked network refresh");
+        } finally {
+            releaseNetwork.countDown();
+            network.join(2000);
+        }
+        check(!network.isAlive(), "Blocked-network startup test releases its monitor");
+        playbackRepo.settings.prefs.edit().putString("refresh", "manual").commit();
         runOnMainSync(() -> controller[0].stop());
         JSONObject stopped = readHealth(directory);
         check(!stopped.getBoolean("active"), "Stop cancels playback");

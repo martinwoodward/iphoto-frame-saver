@@ -16,6 +16,10 @@ Designed for touchscreens and older frames, including Android 6.0 (API 23).
 - **Streaming by default**: download the current full-resolution photo and
   prefetch the **next five**, not the whole album. Images are sampled to a bounded
   screen-sized pixel budget before decoding.
+- These **six photos are kept in persistent app storage**, not Android's
+  disposable cache. Setup and metadata checks fill the startup cache; after a
+  restart the first photo comes from saved storage before any network refresh.
+  First-ever setup needs a connection, and smaller albums cache all their photos.
 - Optional, explicit offline album downloads to app-private storage or a folder
   selected with Android's Storage Access Framework (including writable removable
   storage). Downloads run in a foreground service and can be stopped and resumed.

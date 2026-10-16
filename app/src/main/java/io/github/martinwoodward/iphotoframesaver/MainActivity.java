@@ -153,7 +153,7 @@ public final class MainActivity extends Activity {
         right.addView(dreamTip);
         label(right, "PHOTO STORAGE");
         storage = new RadioGroup(this);
-        String[] modes = {"Stream / keep next 5 photos", "Offline / app-local storage", "Offline / attached storage"};
+        String[] modes = {"Stream / keep 6 photos for startup", "Offline / app-local storage", "Offline / attached storage"};
         String[] modeValues = {"stream", "internal", "attached"};
         for (int i = 0; i < modes.length; i++) {
             RadioButton option = new RadioButton(this);
@@ -197,7 +197,7 @@ public final class MainActivity extends Activity {
         page.addView(privacy, footer);
         setContentView(scroll);
         page.requestFocus();
-        repo.background.execute(repo::load);
+        repo.background.execute(() -> repo.prepareStartupCache(repo.load()));
         if (repo.settings.album().isEmpty() && state == null) scroll.post(() -> albumDialog(true));
     }
 
@@ -320,7 +320,7 @@ public final class MainActivity extends Activity {
         checking = true;
         updateStatus();
         repo.background.execute(() -> {
-            try { repo.refresh(true); }
+            try { repo.prepareStartupCache(repo.refresh(true)); }
             catch (FrameException e) { repo.status = e.getMessage(); }
             runOnUiThread(() -> { checking = false; updateStatus(); });
         });
@@ -367,7 +367,7 @@ public final class MainActivity extends Activity {
         download.setEnabled(!repo.downloading && !"stream".equals(repo.settings.storage()));
         cancel.setVisibility(repo.downloading ? View.VISIBLE : View.GONE);
         downloadStatus.setText(repo.downloadStatus.isEmpty()
-                ? "Streaming downloads only the current photo and the next five. Offline downloads are optional."
+                ? "Six photos stay saved for startup: the current photo and the next five. Offline albums are optional."
                 : repo.downloadStatus);
     }
 
@@ -377,7 +377,8 @@ public final class MainActivity extends Activity {
         handler.post(update);
         RefreshJobService.schedule(this);
         if (!repo.settings.album().isEmpty()) repo.background.execute(() -> {
-            try { repo.refresh(false); } catch (FrameException e) { repo.status = e.getMessage(); }
+            try { repo.prepareStartupCache(repo.refresh(false)); }
+            catch (FrameException e) { repo.status = e.getMessage(); }
         });
     }
     @Override public void onPause() { handler.removeCallbacksAndMessages(null); super.onPause(); }

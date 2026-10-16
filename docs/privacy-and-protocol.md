@@ -73,6 +73,13 @@ add a file; the next cleanup returns to the six-file window. Offline downloads u
 separate staging files, not the streaming window. Partial downloads never become
 playable files. No automatic full-album download occurs in streaming mode.
 
+The six-photo window lives in persistent app files and survives process/device
+restarts. Setup and metadata checks warm it even before slideshow playback.
+Startup selects a saved photo before attempting network refresh or downloads;
+local reads and file leases do not wait on a network-held repository monitor.
+The first setup still needs connectivity to save photos, and clearing app data
+or uninstalling removes this startup cache.
+
 Signed image URLs can expire, including with manual metadata scheduling. A failed
 on-demand fetch can renew metadata, throttled to once per minute, without erasing
 saved data. This technical renewal is independent of automatic discovery timing.

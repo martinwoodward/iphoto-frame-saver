@@ -31,7 +31,7 @@ public final class RefreshJobService extends JobService {
         Repository repo = FrameApp.repo(this);
         repo.background.execute(() -> {
             boolean retry = false;
-            try { repo.refresh(false); }
+            try { repo.prepareStartupCache(repo.refresh(false)); }
             catch (FrameException e) { repo.status = e.getMessage(); retry = true; }
             if (!stopped) jobFinished(params, retry);
         });
