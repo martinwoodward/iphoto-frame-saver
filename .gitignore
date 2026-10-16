@@ -1,0 +1,9 @@
+/build/
+/.android-sdk/
+/local.properties
+/.local/
+/.playwright-mcp/
+*.apk
+*.jks
+*.keystore
+.DS_Store

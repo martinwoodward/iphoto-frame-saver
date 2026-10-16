@@ -1,0 +1,23 @@
+name: Android build and core tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager 'platforms;android-34' 'build-tools;36.0.0'
+      - run: bash scripts/test.sh
+      - run: bash scripts/build.sh release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: photo-frame-saver
+          path: build/photo-frame-saver-release.apk

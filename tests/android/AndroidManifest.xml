@@ -1,0 +1,14 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="io.github.martinwoodward.iphotoframesaver.tests">
+    <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="34" />
+    <application android:label="Frame synthetic tests" android:allowBackup="false" android:debuggable="true">
+        <provider android:name="io.github.martinwoodward.iphotoframesaver.SyntheticDocuments"
+            android:authorities="io.github.martinwoodward.iphotoframesaver.tests.documents"
+            android:exported="true" android:grantUriPermissions="true"
+            android:permission="android.permission.MANAGE_DOCUMENTS" />
+        <activity android:name="io.github.martinwoodward.iphotoframesaver.GrantSyntheticStorage"
+            android:exported="true" />
+    </application>
+    <instrumentation android:name="io.github.martinwoodward.iphotoframesaver.DeviceTests"
+        android:targetPackage="io.github.martinwoodward.iphotoframesaver" />
+</manifest>
