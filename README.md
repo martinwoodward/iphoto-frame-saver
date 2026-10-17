@@ -52,12 +52,14 @@ an available JPEG rendition is used instead.
    https://photos.icloud.com/shared/album/SyntheticExampleToken123/
    https://www.icloud.com/sharedalbum/#SyntheticExampleToken123
    ```
-
+   You get this by creating a shared album, in the sharing options select `Anyone with the Link` and then press `Copy Link`.
+   I do it with a dedicated album called `Frame` that I know should contain images destined for the family dashboard.
+   
    The corresponding `icloud.com.cn` routes are supported too. Examples here are
    deliberately synthetic, not working albums.
-3. Tap **Start slideshow**. Tap the slideshow to show **Next photo** and
+4. Tap **Start slideshow**. Tap the slideshow to show **Next photo** and
    **Settings** controls.
-4. For automatic screensaver playback, tap **Choose Android screensaver**, select
+5. For automatic screensaver playback, tap **Choose Android screensaver**, select
    **Photo Frame Saver**, and choose the device's charging/docking activation
    options. Touching a running screensaver exits it, as on Android's native
    screensavers.
