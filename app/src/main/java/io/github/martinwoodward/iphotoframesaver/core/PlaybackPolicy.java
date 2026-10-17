@@ -2,7 +2,16 @@ package io.github.martinwoodward.iphotoframesaver.core;
 
 public final class PlaybackPolicy {
     public static final int PREFETCH = 5;
+    public static final int STARTUP_CACHE = 10;
     private PlaybackPolicy() {}
+
+    public static java.util.List<Photo> recentPhotos(java.util.List<Photo> photos) {
+        java.util.List<Photo> recent = new java.util.ArrayList<>(photos);
+        // The CloudKit query is oldest-added first; preserve that fallback for older saved metadata.
+        java.util.Collections.reverse(recent);
+        java.util.Collections.sort(recent, (a, b) -> Long.compare(b.sharedAt, a.sharedAt));
+        return new java.util.ArrayList<>(recent.subList(0, Math.min(STARTUP_CACHE, recent.size())));
+    }
 
     public static long refreshMillis(String mode) {
         if ("daily".equals(mode)) return 86_400_000L;

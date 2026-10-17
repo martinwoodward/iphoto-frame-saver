@@ -21,7 +21,11 @@ public final class AlbumParser {
             JSONArray records = page.getJSONArray("records");
             for (int i = 0; i < records.length(); i++) {
                 JSONObject r = records.getJSONObject(i);
-                if (r.optBoolean("deleted")) continue;
+                if (r.optBoolean("deleted")) {
+                    assets.remove(r.getString("recordName"));
+                    masters.remove(r.getString("recordName"));
+                    continue;
+                }
                 String type = r.optString("recordType");
                 if ("CPLMaster".equals(type)) masters.put(r.getString("recordName"), r);
                 if ("CPLAsset".equals(type)) assets.put(r.getString("recordName"), r);
@@ -51,7 +55,8 @@ public final class AlbumParser {
                 int orientation = rendered ? 1 : number(asset, "orientation",
                         number(master, "originalOrientation", 1));
                 result.add(new Photo(entry.getKey(), url, thumb, orientation,
-                        number(master, "resOriginalWidth", 0), number(master, "resOriginalHeight", 0)));
+                        number(master, "resOriginalWidth", 0), number(master, "resOriginalHeight", 0),
+                        timestamp(asset, "mostRecentAddedDate", timestamp(asset, "addedDate", 0))));
             }
             return result;
         }
@@ -85,7 +90,7 @@ public final class AlbumParser {
             String url = location.getString("scheme") + "://" + location.getJSONArray("hosts").getString(0)
                     + item.getString("url_path");
             result.add(new Photo(p.getString("photoGuid"), url, "", 1,
-                    best.optInt("width"), best.optInt("height")));
+                    best.optInt("width"), best.optInt("height"), sharedDate(p.optString("batchDateCreated"))));
         }
         return result;
     }
@@ -112,5 +117,26 @@ public final class AlbumParser {
     private static int number(JSONObject fields, String key, int fallback) {
         JSONObject field = fields.optJSONObject(key);
         return field == null ? fallback : field.optInt("value", fallback);
+    }
+
+    private static long timestamp(JSONObject fields, String key, long fallback) {
+        JSONObject field = fields.optJSONObject(key);
+        return field == null ? fallback : field.optLong("value", fallback);
+    }
+
+    private static long sharedDate(String value) throws JSONException {
+        if (value.isEmpty()) return 0;
+        try { return Long.parseLong(value); }
+        catch (NumberFormatException e) {
+            String normalized = value.replaceFirst("Z$", "+0000").replaceFirst("([+-]\\d\\d):(\\d\\d)$", "$1$2");
+            for (String pattern : new String[] {"yyyy-MM-dd'T'HH:mm:ss.SSSZ", "yyyy-MM-dd'T'HH:mm:ssZ"}) {
+                java.text.SimpleDateFormat format = new java.text.SimpleDateFormat(pattern, Locale.ROOT);
+                format.setLenient(false);
+                java.text.ParsePosition position = new java.text.ParsePosition(0);
+                java.util.Date date = format.parse(normalized, position);
+                if (date != null && position.getIndex() == normalized.length()) return date.getTime();
+            }
+            throw new JSONException("Photo shared date invalid");
+        }
     }
 }

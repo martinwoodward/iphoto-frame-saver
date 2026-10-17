@@ -73,12 +73,30 @@ add a file; the next cleanup returns to the six-file window. Offline downloads u
 separate staging files, not the streaming window. Partial downloads never become
 playable files. No automatic full-album download occurs in streaming mode.
 
-The six-photo window lives in persistent app files and survives process/device
-restarts. Setup and metadata checks warm it even before slideshow playback.
-Startup selects a saved photo before attempting network refresh or downloads;
-local reads and file leases do not wait on a network-held repository monitor.
-The first setup still needs connectivity to save photos, and clearing app data
-or uninstalling removes this startup cache.
+A separate persistent startup set pins the ten most recently shared photos,
+independently of the six-file rolling window. There are at most sixteen distinct
+completed files across these caches, apart from briefly leased/in-flight files.
+Setup, metadata checks, and playback warm this set, even before slideshow playback.
+Modern records use `mostRecentAddedDate`, falling back to `addedDate`; legacy
+records use `batchDateCreated`, never the capture date. Older saved metadata
+without sharing timestamps falls back to the ascending added-date query order
+until refreshed.
+
+Startup chooses randomly from the available recent ten, avoiding the previous
+photo where possible, and fades in without a loading banner. Local reads and file
+leases do not wait on a network-held repository monitor. The selected startup
+photo is consumed from the full-album shuffle, not a separate rotation.
+Membership changes preserve the current cycle's unseen photos, remove deleted
+IDs, and insert new IDs. A successful refresh prunes deleted streaming/startup
+files when not leased, and stale in-flight results cannot display a removed ID.
+Offline files are retained but only current album IDs remain playable.
+Failed fetches remain unseen and are deferred so they cannot block other photos.
+If unseen photos are unavailable offline, a separate saved-subset cycle keeps
+playback going without discarding the unfinished full-album cycle.
+
+The first setup still needs connectivity to save photos. An older available cache
+is the startup fallback until the recent set is ready; clearing app data or
+uninstalling removes both app-private caches.
 
 Signed image URLs can expire, including with manual metadata scheduling. A failed
 on-demand fetch can renew metadata, throttled to once per minute, without erasing

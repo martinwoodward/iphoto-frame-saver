@@ -10,15 +10,21 @@ Designed for touchscreens and older frames, including Android 6.0 (API 23).
 - An optional clock and date on a rounded, translucent black panel. Enable
   **Show clock and date** in settings; it follows Android's date, locale, time
   zone, and 12/24-hour preferences and updates when those change. Off by default.
-- Randomized cycles covering the whole album, without immediate repeats.
+- Randomized cycles covering the whole album before repeating. A startup photo
+  counts toward that cycle; successful metadata checks remove deleted photos
+  and add new photos without resetting progress through the current cycle.
 - A configurable interval: **30 seconds by default**, available during first-run
   setup and in settings.
 - **Streaming by default**: download the current full-resolution photo and
   prefetch the **next five**, not the whole album. Images are sampled to a bounded
   screen-sized pixel budget before decoding.
-- These **six photos are kept in persistent app storage**, not Android's
-  disposable cache. Setup and metadata checks fill the startup cache; after a
-  restart the first photo comes from saved storage before any network refresh.
+- Separately, the **ten most recently shared photos** are kept in persistent app
+  storage for startup, not Android's disposable cache. Setup and metadata checks
+  maintain this small pinned set, independently of the current-plus-five streaming
+  window (at most sixteen distinct completed files, often fewer).
+  After a restart, choose randomly from the saved recent ten before network work,
+  then continue a full-album shuffle without repeating that startup photo early.
+  Cached startups fade straight into the first image without a loading banner.
   First-ever setup needs a connection, and smaller albums cache all their photos.
 - Optional, explicit offline album downloads to app-private storage or a folder
   selected with Android's Storage Access Framework (including writable removable
@@ -76,13 +82,18 @@ Offline copies are retained independently of the six-file streaming window.
 Downloading is explicit: metadata checks discover new photos but do not silently
 download a whole offline album. Tap Download again to save additions. Existing
 offline files are not automatically erased when photos disappear from an album.
+They do leave playback rotation at the next successful configured metadata check
+or **Force check...**, even if an older offline file remains on storage.
 Choose streaming again to stop further bulk downloads; existing offline copies
 remain available. Uninstalling the app removes app-private data, but not copies
 on storage you selected.
 
-If there is no connection, the slideshow rotates through saved photos instead of
-going blank. Before the first successful connection/download there are no photos
-to show; an explanation appears instead.
+If there is no connection, the slideshow exhausts unseen saved photos first, then
+cycles through the available saved subset instead of going blank. It resumes
+unfinished full-album progress when connectivity returns; photos that could not
+be fetched are not counted as shown. An older cached photo is a startup fallback
+if the recent set is not available yet. Before the first successful connection/
+download there are no photos to show; an explanation appears instead.
 
 ## Build
 

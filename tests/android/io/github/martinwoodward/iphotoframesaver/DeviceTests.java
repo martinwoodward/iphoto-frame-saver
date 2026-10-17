@@ -129,9 +129,8 @@ public final class DeviceTests extends Instrumentation {
         check(restored.playableIds(snapshot).size() == 6, "Six saved photos retained offline");
         Repository cold = new Repository(isolated);
         check(cold.cachedIds(cold.load()).size() == 6, "Six startup photos survive repository/process recreation");
-        cold.prepareStartupCache(cold.current);
-        check(stream.listFiles().length == 6, "A full startup cache does not bulk-download the album");
-        cold.background.shutdownNow();
+        check(cold.cachedStartupIds(cold.current).size() == 6, "Existing cache remains playable during upgrade");
+        cold.close();
         restored.settings.prefs.edit().putString("storage", "internal").commit();
         File offline = new File(new File(directory, "offline"), key);
         check(offline.isDirectory() || offline.mkdirs(), "Offline directory");
@@ -193,17 +192,108 @@ public final class DeviceTests extends Instrumentation {
         for (int i = 3; i < snapshot.photos.size(); i++) {
             fullDrive.save(Repository.filename(snapshot.photos.get(i)), source);
         }
+        JSONArray larger = new JSONArray();
+        for (int i = 0; i < 13; i++) {
+            Photo dated = new Photo("synthetic-photo-" + i, "https://example.icloud-content.com/synthetic",
+                    "", 1, 64, 64, i * 1000L);
+            larger.put(dated.json());
+            if (i >= 8) fullDrive.save(Repository.filename(dated), source);
+        }
         try (FileOutputStream out = new FileOutputStream(metadata)) {
-            out.write(new JSONObject().put("refreshed", System.currentTimeMillis()).put("photos", photos)
+            out.write(new JSONObject().put("refreshed", System.currentTimeMillis()).put("photos", larger)
                     .toString().getBytes(StandardCharsets.UTF_8));
         }
+        Photo added = new Photo("synthetic-photo-13", "https://example.icloud-content.com/synthetic", "", 1, 64, 64, 13000L);
+        fullDrive.save(Repository.filename(added), copied);
         Repository warmed = new Repository(isolated);
         warmed.prepareStartupCache(warmed.load());
+        File startup = new File(new File(directory, "startup"), key);
         long warmingDeadline = System.currentTimeMillis() + 5000;
-        while (warmed.cachedIds(warmed.current).size() < 6 && System.currentTimeMillis() < warmingDeadline) Thread.sleep(20);
-        check(warmed.cachedIds(warmed.current).size() == 6, "Larger saved album warms exactly six startup photos");
-        check(stream.listFiles().length == 6, "Startup warming does not copy the entire attached album");
-        warmed.background.shutdownNow();
+        while ((!startup.isDirectory() || photoCount(startup) < 10)
+                && System.currentTimeMillis() < warmingDeadline) Thread.sleep(20);
+        check(photoCount(startup) == 10, "Larger saved album warms exactly ten startup photos");
+        check(warmed.cachedStartupIds(warmed.current).size() == 10, "All ten recent photos are playable");
+        for (int i = 0; i < 13; i++) {
+            Photo dated = Photo.fromJson(larger.getJSONObject(i));
+            check(new File(startup, Repository.filename(dated)).isFile() == (i >= 3),
+                    "Only the ten most recently shared photos are pinned for startup");
+        }
+        check(stream.listFiles().length <= 6, "Recent-photo warming preserves the separate bounded lookahead");
+        Repository restarted = new Repository(isolated);
+        check(restarted.cachedStartupIds(restarted.load()).size() == 10, "Newest-ten cache survives process recreation");
+        restarted.close();
+        SlideshowController[] rotation = new SlideshowController[1];
+        runOnMainSync(() -> {
+            rotation[0] = new SlideshowController(real, "synthetic-rotation", warmed);
+            rotation[0].start();
+        });
+        check(waitForRender(directory, 1), "Recent-photo startup renders");
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        String first = warmed.settings.prefs.getString("last_displayed", "");
+        check(warmed.cachedStartupIds(warmed.current).contains(first), "Controller starts within the recent ten");
+        seen.add(first);
+        for (int render = 2; render <= 13; render++) {
+            runOnMainSync(() -> rotation[0].next());
+            check(waitForRender(directory, render), "Full-album rotation renders");
+            check(seen.add(warmed.settings.prefs.getString("last_displayed", "")),
+                    "Startup photo cannot repeat before all thirteen photos are shown");
+        }
+        seen.clear();
+        for (int render = 14; render <= 16; render++) {
+            runOnMainSync(() -> rotation[0].next());
+            check(waitForRender(directory, render), "Next rotation begins");
+            check(seen.add(warmed.settings.prefs.getString("last_displayed", "")), "Next cycle begins without repeats");
+        }
+        Photo removed = null;
+        for (Photo recent : io.github.martinwoodward.iphotoframesaver.core.PlaybackPolicy.recentPhotos(warmed.current.photos)) {
+            if (!seen.contains(recent.id)) { removed = recent; break; }
+        }
+        check(removed != null, "Unseen recent deletion fixture");
+        Repository.Lease removedLease = warmed.acquireCached(warmed.current, removed);
+        List<Photo> changed = new ArrayList<>(warmed.current.photos);
+        changed.remove(removed);
+        changed.add(added);
+        synchronized (warmed) {
+            warmed.current = new Repository.Snapshot(key, changed, System.currentTimeMillis());
+            warmed.pruneUnavailable(warmed.current);
+        }
+        check(removedLease != null && removedLease.file.isFile(), "Metadata deletion respects active decode leases");
+        check(!warmed.cachedIds(warmed.current).contains(removed.id), "Removed photo immediately leaves available rotation");
+        removedLease.close();
+        warmed.pruneUnavailable(warmed.current);
+        check(!removedLease.file.exists(), "Deleted photo is pruned after its lease closes");
+        warmed.prepareStartupCache(warmed.current);
+        for (int render = 17; render <= 26; render++) {
+            runOnMainSync(() -> rotation[0].next());
+            check(waitForRender(directory, render), "Updated album rotation renders");
+            String displayed = warmed.settings.prefs.getString("last_displayed", "");
+            check(!displayed.equals(removed.id) && seen.add(displayed), "Refresh preserves unseen progress and excludes deletion");
+        }
+        check(seen.size() == 13 && seen.contains(added.id), "Updated cycle includes every surviving and newly shared photo");
+        java.lang.reflect.Field lastAttempt = Repository.class.getDeclaredField("lastAttempt");
+        lastAttempt.setAccessible(true);
+        lastAttempt.setLong(warmed, System.currentTimeMillis());
+        warmed.current = new Repository.Snapshot(key, new ArrayList<>(), System.currentTimeMillis());
+        warmed.status = "No photos found. Add photos to the shared album, then check again.";
+        runOnMainSync(() -> rotation[0].next());
+        long emptyDeadline = System.currentTimeMillis() + 2000;
+        boolean[] empty = new boolean[1];
+        while (!empty[0] && System.currentTimeMillis() < emptyDeadline) {
+            runOnMainSync(() -> empty[0] = loadingBannerVisible(rotation[0]));
+            Thread.sleep(20);
+        }
+        check(empty[0], "Deleting every photo shows the empty-album message");
+        runOnMainSync(() -> {
+            for (int i = 0; i < rotation[0].view().getChildCount(); i++) {
+                android.view.View child = rotation[0].view().getChildAt(i);
+                if (child instanceof android.widget.ImageView) {
+                    check(((android.widget.ImageView) child).getDrawable() == null,
+                            "An emptied album cannot leave a deleted photo on screen");
+                }
+            }
+        });
+        runOnMainSync(() -> rotation[0].close());
+        warmed.close();
         Photo corrupt = new Photo("synthetic-corrupt", "https://example.icloud-content.com/synthetic", "", 1, 64, 64);
         File corruptBytes = new File(directory, "corrupt.photo");
         try (FileOutputStream out = new FileOutputStream(corruptBytes)) { out.write(new byte[] {1, 2, 3}); }
@@ -214,6 +304,10 @@ public final class DeviceTests extends Instrumentation {
         check(!afterCorruption.contains(Repository.filename(corrupt)), "Corrupt attached photo can be downloaded again");
         downloader.settings.prefs.edit().putString("storage", "internal").remove("tree").commit();
         // One cached photo isolates lifecycle checks from all network access.
+        try (java.io.InputStream in = new java.io.FileInputStream(copied);
+             FileOutputStream out = new FileOutputStream(source)) {
+            Net.transfer(in, out, 10000);
+        }
         try (FileOutputStream out = new FileOutputStream(metadata)) {
             out.write(new JSONObject().put("refreshed", System.currentTimeMillis())
                     .put("photos", new JSONArray().put(snapshot.photos.get(0).json()))
@@ -274,10 +368,18 @@ public final class DeviceTests extends Instrumentation {
                     .toString().getBytes(StandardCharsets.UTF_8));
         }
         java.util.concurrent.CountDownLatch networkBlocked = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch releaseCachedRead = new java.util.concurrent.CountDownLatch(1);
         java.util.concurrent.CountDownLatch releaseNetwork = new java.util.concurrent.CountDownLatch(1);
+        java.lang.reflect.Field cacheLockField = Repository.class.getDeclaredField("cacheLock");
+        cacheLockField.setAccessible(true);
+        Object cacheLock = cacheLockField.get(playbackRepo);
         Thread network = new Thread(() -> {
             synchronized (playbackRepo) {
-                networkBlocked.countDown();
+                synchronized (cacheLock) {
+                    networkBlocked.countDown();
+                    try { releaseCachedRead.await(10, java.util.concurrent.TimeUnit.SECONDS); }
+                    catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                }
                 try { releaseNetwork.await(10, java.util.concurrent.TimeUnit.SECONDS); }
                 catch (InterruptedException e) { Thread.currentThread().interrupt(); }
             }
@@ -289,9 +391,17 @@ public final class DeviceTests extends Instrumentation {
             runOnMainSync(() -> {
                 controller[0] = new SlideshowController(real, "synthetic-lifecycle", playbackRepo);
                 controller[0].start();
+                check(!loadingBannerVisible(controller[0]), "Cached startup fades into its first photo without a loading banner");
             });
+            Thread.sleep(100);
+            check(readHealth(directory).getInt("renders") == 0, "Cached decode is pending during the loading UI check");
+            runOnMainSync(() -> {
+                check(!loadingBannerVisible(controller[0]), "Loading text stays hidden while the first cached photo is decoding");
+            });
+            releaseCachedRead.countDown();
             check(waitForRender(directory, 1), "Cold startup renders cached photo before an overdue or blocked network refresh");
         } finally {
+            releaseCachedRead.countDown();
             releaseNetwork.countDown();
             network.join(2000);
         }
@@ -324,13 +434,25 @@ public final class DeviceTests extends Instrumentation {
         runOnMainSync(() -> { controller[0].stop(); controller[0].start(); controller[0].close(); });
         Thread.sleep(250);
         check(!readHealth(directory).getBoolean("active"), "Rapid lifecycle change rejects stale decode");
-        repo.background.shutdownNow();
-        restored.background.shutdownNow();
-        playbackRepo.background.shutdownNow();
-        downloader.background.shutdownNow();
-        corruptReader.background.shutdownNow();
+        repo.close();
+        restored.close();
+        playbackRepo.close();
+        downloader.close();
+        corruptReader.close();
         resultCleanup(directory);
         isolated.getSharedPreferences("frame", 0).edit().clear().commit();
+    }
+    private boolean loadingBannerVisible(SlideshowController controller) {
+        for (int i = 0; i < controller.view().getChildCount(); i++) {
+            android.view.View child = controller.view().getChildAt(i);
+            if (child instanceof android.widget.TextView
+                    && child.getVisibility() == android.view.View.VISIBLE) return true;
+        }
+        return false;
+    }
+    private int photoCount(File directory) {
+        File[] files = directory.listFiles((parent, name) -> name.endsWith(".photo"));
+        return files == null ? 0 : files.length;
     }
     private void resultCleanup(File path) throws java.io.IOException {
         File[] children = path.listFiles();

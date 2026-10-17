@@ -44,7 +44,9 @@ final class Repository {
     final Settings settings;
     final ExecutorService background = Executors.newSingleThreadExecutor();
     private final ExecutorService prefetcher = Executors.newSingleThreadExecutor();
+    private final ExecutorService startupWarmer = Executors.newSingleThreadExecutor();
     private final AtomicInteger prefetchGeneration = new AtomicInteger();
+    private final AtomicInteger startupGeneration = new AtomicInteger();
     volatile Snapshot current = new Snapshot("", Collections.emptyList(), 0);
     volatile String status = "Add a public shared album to get started.";
     volatile String downloadStatus = "";
@@ -57,6 +59,8 @@ final class Repository {
     // Saved-photo startup must not wait for the monitor held by network transfers.
     private final Object metadataLock = new Object();
     private final Object cacheLock = new Object();
+    private String startupTarget = "";
+    private boolean warmingStartup;
 
     final class Lease implements AutoCloseable {
         final File file;
@@ -149,6 +153,7 @@ final class Repository {
                 if (!before.key.equals(key())) return loadSaved();
                 write(new AtomicFile(metadata(before.key)), json.toString().getBytes(StandardCharsets.UTF_8));
                 current = new Snapshot(before.key, photos, refreshed);
+                pruneUnavailable(current);
                 status = photos.isEmpty() ? "No photos found. Add photos to the shared album, then check again."
                         : "Album up to date. " + photos.size() + " photos ready.";
                 return current;
@@ -194,7 +199,9 @@ final class Repository {
         File offline = new File(new File(new File(context.getFilesDir(), "offline"), snapshot.key), name);
         if (offline.isFile()) return offline;
         File stream = new File(new File(new File(context.getFilesDir(), "stream"), snapshot.key), name);
-        return stream.isFile() ? stream : null;
+        if (stream.isFile()) return stream;
+        File startup = new File(new File(new File(context.getFilesDir(), "startup"), snapshot.key), name);
+        return startup.isFile() ? startup : null;
     }
 
     Lease acquireCached(Snapshot snapshot, Photo photo) {
@@ -210,24 +217,94 @@ final class Repository {
         return result;
     }
 
+    List<String> cachedStartupIds(Snapshot snapshot) {
+        List<String> result = new ArrayList<>();
+        for (Photo photo : PlaybackPolicy.recentPhotos(snapshot.photos)) {
+            if (cachedFile(snapshot, photo) != null) result.add(photo.id);
+        }
+        return result;
+    }
+
     void prepareStartupCache(Snapshot snapshot) {
         if (snapshot.key.isEmpty() || !snapshot.key.equals(key())) return;
-        int target = Math.min(PlaybackPolicy.PREFETCH + 1, snapshot.photos.size());
-        List<String> window = cachedIds(snapshot);
-        if (window.size() >= target) return;
-        List<String> choices = new ArrayList<>();
-        for (Photo photo : snapshot.photos) choices.add(photo.id);
-        Collections.shuffle(choices);
-        for (String id : choices) {
-            if (window.size() == target) break;
-            if (!window.contains(id)) window.add(id);
+        List<Photo> recent = PlaybackPolicy.recentPhotos(snapshot.photos);
+        Set<String> wanted = new HashSet<>();
+        for (Photo photo : recent) wanted.add(filename(photo));
+        int generation;
+        synchronized (cacheLock) {
+            if (snapshot != current) return;
+            pruneDirectory("startup", snapshot.key, wanted);
+            String target = snapshot.key + new java.util.TreeSet<>(wanted);
+            if (target.equals(startupTarget) && warmingStartup) return;
+            boolean complete = true;
+            for (String name : wanted) {
+                if (!new File(new File(new File(context.getFilesDir(), "startup"), snapshot.key), name).isFile()) {
+                    complete = false;
+                }
+            }
+            generation = startupGeneration.incrementAndGet();
+            startupTarget = target;
+            warmingStartup = !complete;
+            if (complete) return;
         }
-        prefetch(snapshot, "", window);
+        startupWarmer.execute(() -> {
+            try {
+                warmStartup(snapshot, recent, generation);
+            } finally {
+                synchronized (cacheLock) {
+                    if (generation == startupGeneration.get()) warmingStartup = false;
+                }
+            }
+        });
+    }
+
+    private void warmStartup(Snapshot snapshot, List<Photo> recent, int generation) {
+        for (Photo photo : recent) {
+            if (generation != startupGeneration.get() || !snapshot.key.equals(key())) return;
+            File temporary = null;
+            try {
+                File destination = new File(directory("startup", snapshot.key), filename(photo));
+                if (destination.isFile()) continue;
+                temporary = new File(destination.getPath() + ".part");
+                if (destination.getParentFile().getUsableSpace() < 160L * 1024 * 1024) {
+                    throw new FrameException(FrameException.STORAGE);
+                }
+                boolean copied = false;
+                try (Lease source = acquireCached(snapshot, photo)) {
+                    if (source != null) {
+                        try (java.io.InputStream in = new java.io.FileInputStream(source.file);
+                             FileOutputStream out = new FileOutputStream(temporary)) {
+                            Net.transfer(in, out, 128L * 1024 * 1024);
+                            out.getFD().sync();
+                        }
+                        copied = true;
+                    }
+                }
+                if (!copied) copied = copyAttached(snapshot, photo, temporary);
+                if (!copied) fetchPhoto(snapshot, photo, temporary);
+                if (!decodable(temporary)) throw new FrameException(FrameException.DECODE);
+                synchronized (cacheLock) {
+                    if (generation != startupGeneration.get() || !snapshot.key.equals(key())
+                            || !snapshot.key.equals(current.key) || current.find(photo.id) == null) continue;
+                    if (!temporary.renameTo(destination)) throw new FrameException(FrameException.STORAGE);
+                }
+            } catch (IOException e) {
+                status = FrameException.STORAGE;
+            } catch (FrameException e) {
+                status = e.getMessage();
+            } finally {
+                if (temporary != null && temporary.exists() && !temporary.delete()) status = FrameException.STORAGE;
+            }
+        }
     }
 
     synchronized Lease acquire(Snapshot snapshot, Photo photo, boolean network) throws FrameException {
+        Lease cached = acquireCached(snapshot, photo);
+        if (cached != null) return cached;
         File source = file(snapshot, photo, network);
-        return source == null ? null : new Lease(source, false);
+        synchronized (cacheLock) {
+            return source == null || !source.isFile() ? null : new Lease(source, false);
+        }
     }
 
     synchronized File file(Snapshot snapshot, Photo photo, boolean network) throws FrameException {
@@ -236,29 +313,12 @@ final class Repository {
         if (offline.isFile()) return offline;
         File stream = new File(directory("stream", snapshot.key), name);
         if (stream.isFile()) return stream;
+        File startup = new File(directory("startup", snapshot.key), name);
+        if (startup.isFile()) return startup;
         File temporary = new File(stream.getParentFile(), name + ".part");
-        if ("attached".equals(settings.storage())) {
-            AttachedStorage storage = attached(snapshot.key);
-            if (storage != null) {
-                try {
-                    if (storage.contains(name) && stream.getParentFile().getUsableSpace() < 160L * 1024 * 1024) {
-                        throw new FrameException(FrameException.STORAGE);
-                    }
-                    if (storage.copyTo(name, temporary)) {
-                        if (!decodable(temporary)) {
-                            storage.invalidate(name);
-                            if (!temporary.delete()) throw new IOException("Damaged cache could not be removed");
-                            status = "A damaged offline photo will be downloaded again when connected.";
-                        } else {
-                            if (!temporary.renameTo(stream)) throw new IOException("Save failed");
-                            return stream;
-                        }
-                    }
-                } catch (IOException | SecurityException | IllegalArgumentException e) {
-                    status = FrameException.STORAGE;
-                    if (temporary.exists() && !temporary.delete()) throw new FrameException(FrameException.STORAGE);
-                }
-            }
+        if (copyAttached(snapshot, photo, temporary)) {
+            if (!temporary.renameTo(stream)) throw new FrameException(FrameException.STORAGE);
+            return stream;
         }
         if (!network) return null;
         if (stream.getParentFile().getUsableSpace() < 160L * 1024 * 1024) {
@@ -271,6 +331,33 @@ final class Repository {
         } finally {
             if (temporary.exists() && !temporary.delete()) status = FrameException.STORAGE;
         }
+    }
+
+    private boolean copyAttached(Snapshot snapshot, Photo photo, File temporary) throws FrameException {
+        if ("attached".equals(settings.storage())) {
+            String name = filename(photo);
+            AttachedStorage storage = attached(snapshot.key);
+            if (storage != null) {
+                try {
+                    if (storage.contains(name) && temporary.getParentFile().getUsableSpace() < 160L * 1024 * 1024) {
+                        throw new FrameException(FrameException.STORAGE);
+                    }
+                    if (storage.copyTo(name, temporary)) {
+                        if (!decodable(temporary)) {
+                            storage.invalidate(name);
+                            if (!temporary.delete()) throw new IOException("Damaged cache could not be removed");
+                            status = "A damaged offline photo will be downloaded again when connected.";
+                        } else {
+                            return true;
+                        }
+                    }
+                } catch (IOException | SecurityException | IllegalArgumentException e) {
+                    status = FrameException.STORAGE;
+                    if (temporary.exists() && !temporary.delete()) throw new FrameException(FrameException.STORAGE);
+                }
+            }
+        }
+        return false;
     }
 
     private void fetchPhoto(Snapshot snapshot, Photo photo, File temporary) throws FrameException {
@@ -312,21 +399,42 @@ final class Repository {
             }
             boolean complete = true;
             for (String id : next) {
-                if (generation != prefetchGeneration.get() || !snapshot.key.equals(key())) return;
+                if (generation != prefetchGeneration.get() || !snapshot.key.equals(key()) || snapshot != current) return;
                 Photo p = snapshot.find(id);
                 if (p == null) continue;
                 try { file(snapshot, p, true); }
                 catch (FrameException e) { complete = false; status = e.getMessage(); }
-                prune(snapshot.key, keep, true);
+                prune(snapshot, keep, true);
             }
-            if (generation == prefetchGeneration.get()) prune(snapshot.key, keep, !complete);
+            if (generation == prefetchGeneration.get()) prune(snapshot, keep, !complete);
         });
     }
 
     void stopPrefetch() { prefetchGeneration.incrementAndGet(); }
 
-    private synchronized void prune(String key, Set<String> wanted, boolean preserveFallback) {
-        synchronized (cacheLock) { pruneLocked(key, wanted, preserveFallback); }
+    void pruneUnavailable(Snapshot snapshot) {
+        Set<String> available = new HashSet<>();
+        for (Photo photo : snapshot.photos) available.add(filename(photo));
+        synchronized (cacheLock) {
+            pruneDirectory("stream", snapshot.key, available);
+            pruneDirectory("startup", snapshot.key, available);
+        }
+    }
+
+    private void pruneDirectory(String type, String key, Set<String> wanted) {
+        File[] files = new File(new File(context.getFilesDir(), type), key).listFiles();
+        if (files == null) return;
+        for (File file : files) {
+            if (file.getName().endsWith(".photo") && !wanted.contains(file.getName())
+                    && !pins.containsKey(file) && !file.delete()) {
+                status = "Some old cache files could not be removed.";
+            }
+        }
+    }
+
+    private synchronized void prune(Snapshot snapshot, Set<String> wanted, boolean preserveFallback) {
+        if (snapshot != current) return;
+        synchronized (cacheLock) { pruneLocked(snapshot.key, wanted, preserveFallback); }
     }
 
     private void pruneLocked(String key, Set<String> wanted, boolean preserveFallback) {
@@ -363,10 +471,8 @@ final class Repository {
     }
 
     private synchronized Lease offlineSource(Snapshot snapshot, Photo p) throws FrameException {
-        File local = new File(directory("offline", snapshot.key), filename(p));
-        if (local.isFile()) return new Lease(local, false);
-        File stream = new File(directory("stream", snapshot.key), filename(p));
-        if (stream.isFile()) return new Lease(stream, false);
+        Lease cached = acquireCached(snapshot, p);
+        if (cached != null) return cached;
         File staging = new File(directory("staging", snapshot.key), filename(p) + ".part");
         if (staging.getParentFile().getUsableSpace() < 160L * 1024 * 1024) throw new FrameException(FrameException.STORAGE);
         try {
@@ -451,5 +557,13 @@ final class Repository {
         } catch (IOException | JSONException e) {
             status = "Playback is running, but local diagnostics could not be saved.";
         }
+    }
+
+    void close() {
+        stopPrefetch();
+        startupGeneration.incrementAndGet();
+        background.shutdownNow();
+        prefetcher.shutdownNow();
+        startupWarmer.shutdownNow();
     }
 }

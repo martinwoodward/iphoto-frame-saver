@@ -45,8 +45,9 @@ final class SlideshowController {
     private int decodedWidth;
     private int decodedHeight;
     private ShuffleDeck deck;
-    private List<String> deckIds = new ArrayList<>();
+    private ShuffleDeck offlineDeck;
     private String deckKey = "";
+    private int deckGeneration = -1;
     private String lastDisplayed;
     private final Runnable tick = this::next;
 
@@ -72,6 +73,7 @@ final class SlideshowController {
         message.setGravity(Gravity.CENTER);
         message.setPadding(48, 32, 48, 32);
         message.setText("Preparing your photos...");
+        message.setVisibility(View.GONE);
         root.addView(message, new FrameLayout.LayoutParams(-1, -1));
         clock = new ClockOverlay(context, repo.settings);
         FrameLayout.LayoutParams clockParams = new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.START);
@@ -89,6 +91,7 @@ final class SlideshowController {
         generation++;
         busy = false;
         starting = true;
+        message.setVisibility(View.GONE);
         clock.start();
         repo.health(surface, renders, decodedWidth, decodedHeight, true);
         next();
@@ -101,6 +104,11 @@ final class SlideshowController {
         handler.removeCallbacksAndMessages(null);
         repo.stopPrefetch();
         clock.stop();
+        clearPhotos();
+        repo.health(surface, renders, decodedWidth, decodedHeight, false);
+    }
+
+    private void clearPhotos() {
         for (int i = 0; i < 2; i++) {
             views[i].animate().setListener(null);
             views[i].animate().cancel();
@@ -108,7 +116,6 @@ final class SlideshowController {
             if (bitmaps[i] != null) bitmaps[i].recycle();
             bitmaps[i] = null;
         }
-        repo.health(surface, renders, decodedWidth, decodedHeight, false);
     }
 
     void close() { stop(); worker.shutdownNow(); }
@@ -129,21 +136,24 @@ final class SlideshowController {
             String selected = null;
             Repository.Snapshot snapshot = repo.load();
             try {
+                if (!active || token != generation) return;
+                reconcileDeck(snapshot, token);
                 if (cachedFirst) {
-                    List<String> saved = repo.cachedIds(snapshot);
-                    ShuffleDeck available = new ShuffleDeck(saved, new Random(), lastDisplayed);
-                    for (int i = 0; i < saved.size() && bitmap == null; i++) {
-                        Photo photo = snapshot.find(available.next());
-                        if (photo == null) continue;
-                        try (Repository.Lease source = repo.acquireCached(snapshot, photo)) {
-                            if (source != null) {
-                                bitmap = decode(source.file, photo, width, height);
-                                selected = photo.id;
-                            }
+                    List<String> saved = repo.cachedStartupIds(snapshot);
+                    if (saved.isEmpty()) saved = repo.cachedIds(snapshot);
+                    try {
+                        Decoded ready = available(snapshot, saved, deck, true, width, height);
+                        if (ready != null) { bitmap = ready.bitmap; selected = ready.id; }
+                    } catch (FrameException e) { error = e.getMessage(); }
+                    if (bitmap == null) {
+                        try {
+                            Decoded ready = available(snapshot, repo.cachedIds(snapshot), deck, true, width, height);
+                            if (ready != null) { bitmap = ready.bitmap; selected = ready.id; }
                         } catch (FrameException e) { error = e.getMessage(); }
                     }
                 }
                 if (bitmap == null) {
+                    preparing(token);
                     try { snapshot = repo.refresh(false); }
                     catch (FrameException e) { error = e.getMessage(); }
                 }
@@ -153,41 +163,40 @@ final class SlideshowController {
                 }
                 List<String> ids = new ArrayList<>();
                 for (Photo p : snapshot.photos) ids.add(p.id);
-                if (!ids.equals(deckIds) || !deckKey.equals(snapshot.key)) {
-                    deckIds = ids;
-                    deckKey = snapshot.key;
-                    deck = new ShuffleDeck(ids, new Random(), selected == null ? lastDisplayed : selected);
-                }
+                reconcileDeck(snapshot, token);
                 if (ids.isEmpty()) throw new FrameException(repo.status);
                 if (bitmap == null) {
-                    String id = deck.next();
-                    if (ids.size() > 1 && id.equals(lastDisplayed)) id = deck.next();
+                    String id = deck.choose(ids);
                     Photo photo = snapshot.find(id);
                     if (photo != null) {
                         try (Repository.Lease source = repo.acquire(snapshot, photo, true)) {
                             bitmap = decode(source == null ? null : source.file, photo, width, height);
                             selected = id;
                         }
-                        catch (FrameException e) { error = e.getMessage(); }
+                        catch (FrameException e) { error = e.getMessage(); deck.defer(id); }
                     }
                 }
                 if (bitmap == null) {
                     List<String> saved = repo.playableIds(snapshot);
-                    ShuffleDeck available = new ShuffleDeck(saved, new Random(), lastDisplayed);
-                    for (int i = 0; i < saved.size() && bitmap == null; i++) {
-                        String candidate = available.next();
-                        Photo p = snapshot.find(candidate);
-                        if (p == null) continue;
-                        try (Repository.Lease source = repo.acquire(snapshot, p, false)) {
-                            bitmap = decode(source == null ? null : source.file, p, width, height);
-                            selected = candidate;
-                        }
-                        catch (FrameException e) { error = e.getMessage(); }
+                    try {
+                        Decoded ready = available(snapshot, saved, deck, false, width, height);
+                        if (ready != null) { bitmap = ready.bitmap; selected = ready.id; }
+                    } catch (FrameException e) { error = e.getMessage(); }
+                    if (bitmap == null) {
+                        if (offlineDeck == null) offlineDeck = new ShuffleDeck(saved, new Random(), lastDisplayed);
+                        else offlineDeck.update(saved);
+                        try {
+                            Decoded ready = available(snapshot, saved, offlineDeck, false, width, height);
+                            if (ready != null) { bitmap = ready.bitmap; selected = ready.id; }
+                        } catch (FrameException e) { error = e.getMessage(); }
                     }
                 }
                 if (bitmap == null) throw new FrameException(error == null ? FrameException.DECODE : error);
                 if (active && token == generation) {
+                    deck.consume(selected);
+                    if (offlineDeck != null) offlineDeck.consume(selected);
                     repo.prefetch(snapshot, selected, deck.peek(PlaybackPolicy.PREFETCH));
+                    repo.prepareStartupCache(snapshot);
                 }
             } catch (FrameException e) {
                 error = e.getMessage();
@@ -197,13 +206,21 @@ final class SlideshowController {
                 final Bitmap result = bitmap;
                 final String safeError = error;
                 final String displayedId = selected;
+                final String displayedKey = snapshot.key;
                 handler.post(() -> {
                     if (!active || token != generation) {
                         if (result != null) result.recycle();
                         return;
                     }
                     busy = false;
+                    Repository.Snapshot latest = repo.load();
+                    if (latest.find(lastDisplayed) == null) clearPhotos();
                     if (result != null) {
+                        if (!latest.key.equals(displayedKey) || latest.find(displayedId) == null) {
+                            result.recycle();
+                            handler.post(tick);
+                            return;
+                        }
                         starting = false;
                         lastDisplayed = displayedId;
                         repo.settings.prefs.edit().putString("last_displayed", displayedId).apply();
@@ -215,6 +232,53 @@ final class SlideshowController {
                     handler.postDelayed(tick, result == null ? 10_000L : repo.settings.interval() * 1000L);
                 });
             }
+        });
+    }
+
+    private void reconcileDeck(Repository.Snapshot snapshot, int token) {
+        List<String> ids = new ArrayList<>();
+        for (Photo photo : snapshot.photos) ids.add(photo.id);
+        if (deck == null || !deckKey.equals(snapshot.key) || deckGeneration != token) {
+            deck = new ShuffleDeck(ids, new Random(), lastDisplayed);
+            offlineDeck = null;
+            deckKey = snapshot.key;
+            deckGeneration = token;
+        } else deck.update(ids);
+    }
+
+    private static final class Decoded {
+        final Bitmap bitmap;
+        final String id;
+        Decoded(Bitmap bitmap, String id) { this.bitmap = bitmap; this.id = id; }
+    }
+
+    private Decoded available(Repository.Snapshot snapshot, List<String> ids, ShuffleDeck choices,
+                              boolean cachedOnly, int width, int height) throws FrameException {
+        List<String> candidates = new ArrayList<>(ids);
+        FrameException failure = null;
+        while (!candidates.isEmpty()) {
+            String id = choices.choose(candidates);
+            if (id == null) break;
+            candidates.remove(id);
+            Photo photo = snapshot.find(id);
+            if (photo == null) continue;
+            try (Repository.Lease source = cachedOnly ? repo.acquireCached(snapshot, photo)
+                    : repo.acquire(snapshot, photo, false)) {
+                return new Decoded(decode(source == null ? null : source.file, photo, width, height), id);
+            } catch (FrameException e) {
+                failure = e;
+                choices.defer(id);
+            }
+        }
+        if (failure != null) throw failure;
+        return null;
+    }
+
+    private void preparing(int token) {
+        handler.post(() -> {
+            if (!active || token != generation || bitmaps[front] != null) return;
+            message.setText("Preparing your photos...");
+            message.setVisibility(View.VISIBLE);
         });
     }
 

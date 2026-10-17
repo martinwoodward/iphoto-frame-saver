@@ -153,7 +153,7 @@ public final class MainActivity extends Activity {
         right.addView(dreamTip);
         label(right, "PHOTO STORAGE");
         storage = new RadioGroup(this);
-        String[] modes = {"Stream / keep 6 photos for startup", "Offline / app-local storage", "Offline / attached storage"};
+        String[] modes = {"Stream / cache 10 newest photos", "Offline / app-local storage", "Offline / attached storage"};
         String[] modeValues = {"stream", "internal", "attached"};
         for (int i = 0; i < modes.length; i++) {
             RadioButton option = new RadioButton(this);
@@ -367,7 +367,7 @@ public final class MainActivity extends Activity {
         download.setEnabled(!repo.downloading && !"stream".equals(repo.settings.storage()));
         cancel.setVisibility(repo.downloading ? View.VISIBLE : View.GONE);
         downloadStatus.setText(repo.downloadStatus.isEmpty()
-                ? "Six photos stay saved for startup: the current photo and the next five. Offline albums are optional."
+                ? "The ten most recently shared photos stay saved for startup, plus the current photo and next five. Offline albums are optional."
                 : repo.downloadStatus);
     }
 

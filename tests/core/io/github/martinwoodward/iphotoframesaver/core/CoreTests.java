@@ -21,6 +21,7 @@ public final class CoreTests {
     public static void main(String[] args) throws Exception {
         addresses();
         shuffle();
+        startupAndMembership();
         refresh();
         sampling();
         cloud();
@@ -98,6 +99,64 @@ public final class CoreTests {
         }
     }
 
+    private static void startupAndMembership() {
+        List<Photo> photos = new ArrayList<>();
+        List<String> ids = new ArrayList<>();
+        for (int i = 0; i < 195; i++) {
+            photos.add(new Photo("photo-" + i, "https://example.icloud-content.com/photo", "", 1, 64, 64, i * 1000L));
+            ids.add("photo-" + i);
+        }
+        List<String> recent = new ArrayList<>();
+        for (Photo photo : PlaybackPolicy.recentPhotos(photos)) recent.add(photo.id);
+        check(recent.size() == 10 && recent.get(0).equals("photo-194")
+                && recent.get(9).equals("photo-185"), "Exactly ten newest sharing timestamps, not capture order");
+        java.util.Collections.reverse(photos);
+        check(PlaybackPolicy.recentPhotos(photos).get(0).id.equals("photo-194"), "Newest selection ignores input ordering");
+        check(PlaybackPolicy.recentPhotos(photos.subList(0, 3)).size() == 3, "Small albums cache every photo");
+        Set<String> starts = new HashSet<>();
+        for (int seed = 0; seed < 100; seed++) {
+            ShuffleDeck deck = new ShuffleDeck(ids, new Random(seed), "photo-194");
+            String first = deck.choose(recent);
+            check(recent.contains(first) && !first.equals("photo-194"), "Random startup is recent and avoids the previous photo");
+            starts.add(first);
+            check(deck.consume(first), "Startup consumes its full-album place");
+            Set<String> seen = new HashSet<>();
+            seen.add(first);
+            for (int i = 1; i < ids.size(); i++) {
+                check(deck.peek(5).size() == 5, "Preferred startup preserves lookahead");
+                check(seen.add(deck.next()), "No startup repeat until every photo has been shown");
+            }
+            check(seen.size() == ids.size(), "Startup cycle covers the complete large album");
+        }
+        check(starts.size() == 9, "Startup randomization reaches every eligible recent photo");
+        List<String> small = new ArrayList<>(Arrays.asList("a", "b", "c", "d", "e"));
+        ShuffleDeck deck = new ShuffleDeck(small, new Random(17), "");
+        String shown = deck.next();
+        String removed = deck.peek(20).get(0);
+        small.remove(removed);
+        small.add("new");
+        deck.update(small);
+        Set<String> seen = new HashSet<>();
+        seen.add(shown);
+        for (int i = 1; i < small.size(); i++) {
+            String next = deck.next();
+            check(!next.equals(removed) && seen.add(next), "Refresh removes deleted IDs without repeating visited photos");
+        }
+        check(seen.contains("new") && seen.containsAll(small), "Newly shared photos join the unfinished cycle");
+        check(!deck.peek(100).contains(removed), "Deleted IDs leave pregenerated future cycles too");
+        deck.update(Arrays.asList("new"));
+        check(deck.peek(5).equals(Arrays.asList("new", "new", "new", "new", "new")), "Shrink to one photo");
+        deck.update(new ArrayList<>());
+        check(deck.next() == null && deck.peek(5).isEmpty(), "Deleting all photos empties the rotation");
+        ShuffleDeck deferred = new ShuffleDeck(Arrays.asList("a", "b", "c"), new Random(4), "");
+        String failed = deferred.peek(10).get(0);
+        deferred.defer(failed);
+        check(!deferred.peek(1).get(0).equals(failed), "Unavailable photo does not block other unseen photos");
+        Set<String> retried = new HashSet<>();
+        for (int i = 0; i < 3; i++) retried.add(deferred.next());
+        check(retried.size() == 3 && retried.contains(failed), "Failed fetch is deferred, not counted as displayed");
+    }
+
     private static void sampling() {
         for (int[] dimensions : new int[][] {{5712, 4284}, {8000, 6000}, {1200, 900},
                 {40000, 30000}, {200000, 200000}, {320, 240}}) {
@@ -141,6 +200,17 @@ public final class CoreTests {
         check(photos.get(0).orientation == 8, "Asset orientation overrides master");
         check(photos.get(0).width == 4000 && photos.get(0).url.endsWith("/original"), "Full resolution preferred");
         check(photos.get(0).fallback.endsWith("/thumb"), "JPEG fallback retained");
+        JSONObject dated = asset("dated", "master-1");
+        dated.getJSONObject("fields").put("addedDate", field(1000L))
+                .put("mostRecentAddedDate", field(2000L)).put("assetDate", field(999999L));
+        AlbumParser.Cloud dates = new AlbumParser.Cloud();
+        dates.add(new JSONObject().put("records", new JSONArray().put(master("master-1", "public.jpeg")).put(dated)));
+        check(dates.photos().get(0).sharedAt == 2000L, "Use latest sharing date, never capture date");
+        dated.getJSONObject("fields").remove("mostRecentAddedDate");
+        check(dates.photos().get(0).sharedAt == 1000L, "Added date fallback");
+        dates.add(new JSONObject().put("records", new JSONArray().put(new JSONObject()
+                .put("recordName", "dated").put("recordType", "CPLAsset").put("deleted", true))));
+        check(dates.photos().isEmpty(), "Cloud deletion tombstones remove earlier records");
         AlbumParser.Cloud missing = new AlbumParser.Cloud();
         missing.add(new JSONObject().put("records", new JSONArray().put(asset("missing", "not-present"))));
         boolean rejected = false;
@@ -180,11 +250,23 @@ public final class CoreTests {
         List<Photo> photos = AlbumParser.legacy(stream, resources);
         check(photos.size() == 1, "Legacy video excluded");
         check(photos.get(0).url.endsWith("/full"), "Largest legacy derivative selected");
+        photo.put("batchDateCreated", "2024-01-02T03:04:05.000Z").put("dateCreated", 9999999999999L);
+        long shared = AlbumParser.legacy(stream, resources).get(0).sharedAt;
+        check(shared == 1704164645000L, "Legacy batch sharing time, not capture date");
+        photo.put("batchDateCreated", shared);
+        check(AlbumParser.legacy(stream, resources).get(0).sharedAt == shared, "Numeric legacy sharing time");
+        photo.put("batchDateCreated", "2024-01-02T04:04:05+01:00");
+        check(AlbumParser.legacy(stream, resources).get(0).sharedAt == shared, "Legacy offset timestamp");
     }
 
     private static void serialization() throws JSONException {
         Photo p = new Photo("synthetic", "https://example.icloud-content.com/photo", "", 9, 4000, 3000);
         Photo q = Photo.fromJson(new JSONObject(p.json().toString()));
         check(q.id.equals(p.id) && q.orientation == 1 && q.width == 4000, "Metadata round trip and orientation guard");
+        JSONObject old = p.json();
+        old.remove("sharedAt");
+        check(Photo.fromJson(old).sharedAt == 0, "Older saved metadata remains readable");
+        Photo dated = new Photo(p.id, p.url, "", 1, 64, 64, 123456789L);
+        check(Photo.fromJson(dated.json()).sharedAt == 123456789L, "Sharing date survives restart");
     }
 }
